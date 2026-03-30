@@ -15,41 +15,69 @@
 
 ---
 
-## 🔍 왜 이 개념이 중요한가
+## 🔍 왜 이 개념이 실무에서 중요한가
 
-### OOM이 발생했을 때, 원인을 모르면 대응이 틀린다
+jemalloc, maxmemory, eviction policy — 이 세 가지는 Redis가 메모리를 얼마나 효율적으로 쓰고, 한계에 다다랐을 때 무엇을 희생하는지 결정한다. 설정 없이 운영하면 OOM으로 프로세스가 종료되거나, 중요한 데이터가 조용히 사라지는 상황을 맞게 된다.
+
+---
+
+## 😱 흔한 실수 (Before — 원리를 모를 때의 접근)
 
 ```
-실무 장애 시나리오:
+실수 1: maxmemory 미설정으로 OOM 발생
 
-  상황: Redis 서버가 갑자기 다운됨
-  로그: "OOM command not allowed when used memory > 'maxmemory'"
-         또는 Linux OOM Killer에 의해 프로세스 종료
+  상황: redis.conf에 maxmemory 설정 없이 운영
+  결과: Redis가 OS 메모리 전체를 점유 → 다른 프로세스 메모리 부족
+        Linux OOM Killer → Redis 프로세스 강제 종료
+        또는 RAM 부족 → 스왑(Swap) 발생 → 응답 시간 수백 ms 폭등
 
-  잘못된 대응 (원리 모름):
-    → 서버 재시작
+  잘못된 대응:
+    → 서버 재시작 (근본 원인 미해결)
     → "Redis가 불안정하다" → 다른 솔루션 검토
-    → maxmemory를 무한정 늘림
+    → maxmemory를 매우 크게 설정 (물리 RAM의 95%)
+       → BGSAVE 시 COW로 추가 메모리 → OOM 재발
 
-  올바른 진단 (원리 앎):
-    → INFO memory 확인
-    → maxmemory 미설정 → OS가 전체 메모리를 Redis에 할당
-    → 다른 프로세스 메모리 부족 → OOM Killer 개입
-    → maxmemory를 물리 메모리의 60~70%로 설정
-    → maxmemory-policy를 서비스 특성에 맞게 선택
-    → 단편화가 심하면 MEMORY PURGE 또는 재시작으로 해소
+실수 2: maxmemory-policy를 역할에 맞지 않게 설정
 
-  이 진단을 하려면 메모리 관리 원리를 알아야 함
+  상황: 결제 상태를 저장하는 Redis에 allkeys-lru 설정
+  결과: 캐시 데이터가 많이 쌓이면 → LRU로 오래된 결제 상태도 제거
+        → 조용한 데이터 손실 (에러조차 발생 안 함)
+        → 결제 완료됐는데 상태 못 찾음 → 중복 결제 시도
 
-maxmemory-policy가 중요한 이유:
-  캐시 전용 Redis: allkeys-lru (모든 키를 캐시로 취급, 공간 부족 시 오래된 것 제거)
-  세션 저장소:     volatile-lru (TTL 있는 키만 제거, 중요 데이터 보호)
-  데이터 저장소:   noeviction  (제거 금지, 쓰기 실패로 알림)
-  
-  잘못된 선택:
-    중요 데이터를 저장하는 Redis에 allkeys-lru 설정
-    → 메모리 부족 시 TTL 없는 중요 데이터도 제거됨
-    → 조용한 데이터 손실!
+실수 3: mem_fragmentation_ratio < 1.0 을 "효율적"이라고 오해
+
+  used_memory_rss < used_memory → 스왑 발생 신호
+  → "단편화가 없어서 좋다"고 오해
+  → 실제로는 Redis 데이터가 디스크 스왑에 있음 → 극심한 성능 저하
+```
+
+---
+
+## ✨ 올바른 접근 (After — 원리를 알고 난 설계/운영)
+
+```
+올바른 maxmemory 설정:
+  persistence 사용: maxmemory = 물리 RAM × 0.5~0.6
+    (BGSAVE fork + COW → 최악 2배 메모리 필요)
+  캐시 전용 (persistence 없음): maxmemory = 물리 RAM × 0.7~0.8
+
+역할별 maxmemory-policy 결정:
+  캐시 (API 응답, 임시 데이터)  → allkeys-lru
+  세션 (TTL 있는 키만 제거)     → volatile-lru
+  결제/주문 (절대 제거 금지)     → noeviction + 알림
+  접근 패턴 명확한 캐시          → allkeys-lfu
+
+단편화 모니터링:
+  INFO memory | grep mem_fragmentation_ratio
+  1.0~1.5: 정상
+  > 2.0: 단편화 심각 → activedefrag yes 또는 재시작
+  < 1.0: 스왑 발생 중 → 즉각 대응 필요
+
+메모리 진단 흐름:
+  INFO memory              → 전체 현황
+  MEMORY DOCTOR            → 자동 진단 메시지
+  MEMORY USAGE key         → 개별 키 메모리
+  INFO stats | grep evicted → 제거된 키 수 (예상치 못한 제거 감지)
 ```
 
 ---
@@ -410,14 +438,14 @@ maxmemory-policy별 특성 비교:
 
 정책              | 제거 대상           | 알고리즘    | CPU 비용  | 데이터 안전성
 ─────────────────┼───────────────────┼──────────┼──────────┼─────────────
-noeviction       | 없음 (에러)         | -        | 최소     | 최고
-allkeys-lru      | 전체 키             | LRU 근사  | 낮음     | 낮음 (모두 제거 가능)
-volatile-lru     | TTL 있는 키만       | LRU 근사  | 낮음     | 중간
-allkeys-lfu      | 전체 키             | LFU      | 중간     | 낮음
-volatile-lfu     | TTL 있는 키만        | LFU      | 중간     | 중간
-allkeys-random   | 전체 키             | 무작위    | 최소     | 낮음
-volatile-random  | TTL 있는 키만        | 무작위    | 최소     | 중간
-volatile-ttl     | TTL 있는 키 중 TTL 짧은 것 | TTL 비교 | 낮음 | 중간
+noeviction       | 없음 (에러)         | -        | 최소       | 최고
+allkeys-lru      | 전체 키             | LRU 근사  | 낮음      | 낮음 (모두 제거 가능)
+volatile-lru     | TTL 있는 키만       | LRU 근사  | 낮음       | 중간
+allkeys-lfu      | 전체 키             | LFU      | 중간      | 낮음
+volatile-lfu     | TTL 있는 키만        | LFU      | 중간      | 중간
+allkeys-random   | 전체 키             | 무작위    | 최소       | 낮음
+volatile-random  | TTL 있는 키만        | 무작위    | 최소       | 중간
+volatile-ttl     | TTL 있는 키 중 TTL 짧은 것 | TTL 비교 | 낮음   | 중간
 
 maxmemory-samples 값별 LRU 정확도:
   samples=3 : 정확도 약 73%, CPU 최소

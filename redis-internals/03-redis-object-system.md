@@ -15,31 +15,78 @@
 
 ---
 
-## 🔍 왜 이 개념이 중요한가
+## 🔍 왜 이 개념이 실무에서 중요한가
 
-### 인코딩을 모르면 메모리 예측이 불가능하다
+Redis의 모든 값은 `redisObject`라는 공통 구조체로 감싸진다. 같은 "string"이어도 내부 인코딩이 `int`, `embstr`, `raw`로 나뉘고, `hash`도 `listpack`과 `hashtable`로 나뉜다. 이 인코딩 차이가 메모리 사용량과 성능을 수 배 이상 바꾼다.
+
+---
+
+## 😱 흔한 실수 (Before — 원리를 모를 때의 접근)
 
 ```
-실무 상황:
+실수 1: Hash 메모리 과대/과소 추정
 
-  "Hash 100만 개를 Redis에 저장할 건데 메모리가 얼마나 필요한가?"
-  
-  답변 1 (인코딩 모름):
-    → "필드 수 × 값 크기로 계산하면 됩니다"
-    → 계산: 100만 × (10 fields × 20 bytes) = 2GB
-    → 실제: 500MB (ziplist 인코딩으로 연속 메모리에 압축 저장)
-    → 4배 과대 추정!
-  
-  답변 2 (인코딩 앎):
-    → "Hash 필드가 128개 이하, 값이 64 bytes 이하면 ziplist 인코딩"
-    → ziplist: 포인터 오버헤드 없이 연속 메모리에 저장 → 일반 구조의 1/4 크기
-    → 임계값 초과 시 hashtable로 전환 → 4배 메모리 증가 가능
-    → "필드를 128개 이하로 유지하면 ziplist 유지 가능"
+  질문: "Hash 100만 개, 필드 10개, 값 평균 20 bytes → 메모리 얼마?"
+  잘못된 계산: 100만 × 10 × 20 = 2 GB
+  실제 결과 (listpack): ~500 MB
+  실제 결과 (hashtable): ~2~4 GB
 
-  인코딩 이해의 실용적 가치:
-    Hash/List/Set 임계값(threshold) 설정으로 메모리 최적화
-    데이터 크기가 임계값에 도달하는 시점 예측 가능
-    OBJECT ENCODING으로 현재 상태 진단 후 최적화 결정
+  원리 모를 때:
+    → 서버 sizing을 2 GB 기준으로 잡음
+    → listpack이면 남아도는 메모리 낭비 (과다 비용)
+    → 필드가 130개로 늘어나면 hashtable 전환 → 메모리 폭발 (예측 실패)
+
+실수 2: APPEND로 String 인코딩이 영구 변경되는 것을 모름
+
+  코드:
+    redis.set("msg", "")
+    redis.append("msg", "hello")  # embstr → raw 강제 전환
+    redis.append("msg", " world") # raw 유지
+
+  원리 모를 때:
+    → "APPEND가 += 연산자처럼 동작하겠지"라고 가정
+    → 실제로는 첫 APPEND에 embstr → raw 영구 전환
+    → 이후 값이 다시 짧아져도 raw 유지 (2회 malloc, 단편화 가능)
+    → 수백만 개 키에 이 패턴 적용 → 메모리 예측 불가
+
+실수 3: OBJECT ENCODING을 확인하지 않고 메모리 최적화 시도
+
+  "Hash를 더 작게 만들면 됩니다" → 필드 이름을 한 글자로 줄임
+  → 정작 hashtable 인코딩인데 listpack으로 안 돌아감
+  → 효과 없음 (이미 전환됨, 역방향 없음)
+```
+
+---
+
+## ✨ 올바른 접근 (After — 원리를 알고 난 설계/운영)
+
+```
+인코딩 기반 메모리 예측:
+  Hash 100만 개 × 10필드 × 20 bytes 값
+  → 필드 수 10 < 128 (listpack 임계값)
+  → 값 크기 20 < 64 bytes
+  → listpack 유지 → ~500 MB (4배 절약)
+
+  필드가 200개로 늘 경우:
+  → hashtable 전환 → ~2~4 GB
+  → 설계 단계에서 필드 분할 (Hash Sharding) 결정
+
+인코딩 제어 설계:
+  hash-max-listpack-entries 128  # 이 범위 안에서 설계
+  hash-max-listpack-value 64     # bytes
+
+카운터는 INCR/DECR (int 인코딩 유지):
+  SET count "0"   → int (정수 감지)
+  INCR count      → int 유지 (ptr에 직접 저장, malloc 0회)
+  
+  APPEND count "x" 하지 말 것
+  → int → raw 전환 → 이후 산술 연산 불가
+
+진단 순서:
+  1. OBJECT ENCODING key     → 현재 인코딩 확인
+  2. MEMORY USAGE key        → 실제 메모리 바이트
+  3. DEBUG OBJECT key        → 직렬화 크기, idle time
+  → 인코딩 확인 후 최적화 방향 결정
 ```
 
 ---

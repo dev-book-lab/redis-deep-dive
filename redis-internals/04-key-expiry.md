@@ -15,37 +15,78 @@
 
 ---
 
-## 🔍 왜 이 개념이 중요한가
+## 🔍 왜 이 개념이 실무에서 중요한가
 
-### "TTL = 60초면 60초 후 사라진다"는 보장이 없다
+`EXPIRE key 60`을 설정했다고 60초 후 즉시 메모리가 회수되지는 않는다. Redis의 만료는 Lazy와 Active 두 경로로 처리되며, 각각 한계가 있다. 이 메커니즘을 모르면 메모리 부족과 Replica 데이터 불일치를 설명할 수 없다.
+
+---
+
+## 😱 흔한 실수 (Before — 원리를 모를 때의 접근)
 
 ```
-실무 상황 1: 메모리가 예상보다 훨씬 많이 사용됨
+실수 1: "TTL = 삭제 시각" 으로 오해
 
-  "100만 개 키에 TTL 60초 설정 → 1시간 후 거의 사라져야 하는데
-   used_memory가 줄지 않는다"
+  설계:
+    100만 개 캐시 키에 TTL 60초 설정
+    → "1분 후 전부 사라져서 메모리가 확보될 것"으로 기대
+    → 실제: 1분 후에도 used_memory 거의 그대로
 
-  원인: Active 만료는 전체 만료 키를 즉시 삭제하지 않음
-        초당 hz 횟수만큼 샘플링으로 일부만 삭제
-        접근이 없는 키는 Active 만료에만 의존
-        만료 키가 많고 샘플링 빈도가 낮으면 → 메모리 회수 지연
+  원인 모를 때:
+    → "Redis 메모리 누수인가?" → 이슈 제기
+    → 인스턴스 재시작으로 임시 해결 반복
 
-  해결:
-    hz 값 증가 (기본 10 → 100, CPU 증가 감수)
-    active-expire-enabled 확인
-    또는 만료 키에 접근해 Lazy 만료 트리거
+  실제 원인:
+    Active 만료는 샘플링 방식 (초당 hz × 20개)
+    100만 개를 모두 처리하려면 수 분~수 시간 필요
+    접근 없는 콜드 키는 Lazy 만료도 안 됨
 
-실무 상황 2: Replica에서 만료된 키가 읽힘
+실수 2: Keyspace Notification을 신뢰할 수 있는 이벤트 트리거로 사용
 
-  "Master에서는 TTL 지난 키가 없는데 Replica에서 GET하면 값이 반환된다"
+  코드:
+    redis.subscribe("__keyevent@0__:expired")
+    → "키 만료 시 후처리 로직 실행" (주문 상태 업데이트 등)
 
-  원인: Replica는 독립적으로 만료 처리를 안 함
-        Master가 만료 명령어(DEL)를 Replica에 전파해야 삭제됨
-        Master가 아직 만료를 처리하지 않았으면 Replica에 DEL 미전파
-        → Replica에서 직접 읽으면 만료된 값 반환 가능
+  문제:
+    Pub/Sub 방식 → 구독자 없을 때 이벤트 유실
+    서버 재배포 중 (연결 끊김) → 만료 이벤트 모두 소실
+    → 처리 안 된 주문 상태가 다수 발생
 
-  해결: Replica 읽기 시 expired 키 필터링 (Redis 3.2+는 일부 개선)
-        애플리케이션에서 TTL 확인 후 유효성 검사
+실수 3: Replica에서 만료 키를 신뢰
+
+  "Master에서 EXPIRE를 설정하면 Replica도 자동으로 처리하겠지"
+  → Replica에서 직접 읽을 때 만료된 값이 반환되는 경우 발생
+  → Master가 아직 만료를 처리하지 않았기 때문
+```
+
+---
+
+## ✨ 올바른 접근 (After — 원리를 알고 난 설계/운영)
+
+```
+메모리 회수 보장이 필요하다면:
+  hz 증가: CONFIG SET hz 50  (CPU 증가 감수)
+  dynamic-hz yes (기본): 연결 수에 따라 자동 조정
+  maxmemory + allkeys-lru 조합: 만료 전에도 공간 확보 가능
+
+TTL 대량 설정 시 "Thundering Expiry" 방지:
+  동일 TTL → 동시에 수십만 키 만료 → Active 만료 부하 집중
+  해결: TTL에 랜덤 지터 추가
+    ttl = 3600 + random.randint(0, 300)  # ±5분 분산
+
+Keyspace Notification 대신 Stream 패턴:
+  신뢰성 필요 → Stream에 만료 예정 이벤트를 미리 기록
+  Consumer Group으로 처리 + ACK → 재처리 보장
+  (Pub/Sub보다 훨씬 안전)
+
+Replica 읽기 시 TTL 직접 확인:
+  val = redis.get(key)
+  if val and redis.ttl(key) > 0:
+      return val
+  # 또는 Redis 3.2+: Replica가 만료 키를 nil 반환 (설정 확인)
+
+만료 모니터링:
+  INFO keyspace → avg_ttl, expires 키 수 확인
+  INFO stats | grep expired_keys → 초당 만료 처리 속도 계산
 ```
 
 ---
