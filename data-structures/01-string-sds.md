@@ -15,38 +15,75 @@
 
 ---
 
-## 🔍 왜 이 개념이 중요한가
+## 🔍 왜 이 개념이 실무에서 중요한가
 
-### String이 Redis에서 가장 기본 타입인 이유
+Redis의 모든 키와 값은 SDS(Simple Dynamic String)로 저장된다. `int`, `embstr`, `raw` 세 가지 인코딩 중 무엇이 선택되느냐에 따라 메모리 사용량과 malloc 횟수가 달라진다. 카운터 하나를 어떻게 관리하느냐가 수백만 키에서 수십 MB 차이를 만들 수 있다.
+
+---
+
+## 😱 흔한 실수 (Before — 원리를 모를 때의 접근)
 
 ```
-Redis의 모든 것이 String 위에 있다:
-  모든 키(key)        → SDS
-  String 값           → SDS 또는 int
-  Hash의 필드/값      → SDS
-  List의 원소         → SDS
-  Set의 원소          → SDS
-  Sorted Set의 멤버   → SDS
+실수 1: 정수 카운터를 SET으로 관리
 
-"String이 느리면 Redis 전체가 느리다"
+  코드:
+    count = int(redis.get("counter") or 0)
+    redis.set("counter", str(count + 1))
 
-실무 영향:
-  1. 메모리 최적화
-     SET user:1:name "Alice"         → raw (5 bytes → sdshdr8)
-     SET user:1:age 30               → int (ptr에 직접)
-     SET session:token:xxxxx "data"  → embstr (짧으면) 또는 raw
-     
-     카운터를 INCR로 관리하면 int 인코딩 → 최소 메모리
-     카운터를 SET "1", SET "2"으로 관리하면 embstr → 낭비
+  문제:
+    SET으로 저장하면 Redis가 정수로 감지 → int 인코딩 (괜찮음)
+    하지만 이 패턴은 GET → 파싱 → +1 → SET 3번의 왕복
+    동시 접근 시 Race Condition 발생 (Read-Modify-Write)
+    
+    또는 str(count + 1) 에서 결과가 "1001" 같은 문자열이 되면
+    Redis가 여전히 int로 인식하지만, 연산 로직 오류 가능
 
-  2. APPEND 패턴의 함정
-     redis-cli SET log ""
-     for line in logs:
-       redis-cli APPEND log line
-     
-     처음: embstr → APPEND 후: raw (한 번 수정되면 영구 raw)
-     raw는 2회 malloc → embstr은 1회 malloc
-     → 로그 누적에 APPEND 반복 시 메모리 단편화 누적
+실수 2: APPEND로 로그/이벤트 누적 후 메모리 폭발
+
+  코드:
+    redis.set("audit:log", "")
+    for event in events:
+        redis.append("audit:log", f"{event}\n")
+
+  문제:
+    처음: SET "" → 빈 string (embstr)
+    첫 APPEND: embstr → raw 강제 전환 (영구)
+    이후 계속 APPEND → raw + 사전 할당 반복
+    100만 번 APPEND → 사전 할당으로 실제 데이터보다 2배 alloc
+    → 메모리 낭비 + GET 시 수 MB 전체 반환 (이벤트 루프 차지)
+
+실수 3: 긴 문자열을 embstr로 착각하고 메모리 계획
+
+  "짧은 값들이라 embstr로 저장되겠지" → 실제로는 45 bytes 이상 → raw
+  raw는 2회 malloc → 단편화 가능
+  메모리 계획이 20~30% 틀어짐
+```
+
+---
+
+## ✨ 올바른 접근 (After — 원리를 알고 난 설계/운영)
+
+```
+카운터는 INCR/INCRBY (int 인코딩 유지 + 원자성 보장):
+  redis.incr("counter")           # 원자적 증가, int 인코딩 유지
+  redis.incrby("counter", 5)      # +5
+  redis.decr("counter")           # 원자적 감소
+  → GET 없이 단일 명령어 → Race Condition 없음 → 최소 메모리
+
+로그/이벤트 누적은 List 또는 Stream:
+  redis.lpush("audit:log", event_json)  # O(1), 각 원소 독립 관리
+  redis.ltrim("audit:log", 0, 9999)     # 최근 1만 건 유지
+  → APPEND 대신 → 각 원소가 독립 SDS → 메모리 예측 가능
+
+인코딩 경계 파악:
+  ≤ 44 bytes → embstr (1회 malloc, jemalloc 64B 슬롯)
+  ≥ 45 bytes → raw (2회 malloc)
+  정수 → int (malloc 0회)
+
+인코딩 확인:
+  OBJECT ENCODING key       → int / embstr / raw
+  MEMORY USAGE key          → 실제 바이트
+  DEBUG OBJECT key          → serializedlength, idle time
 ```
 
 ---
@@ -159,7 +196,7 @@ len과 alloc의 분리:
 │  encoding: OBJ_ENCODING_INT (1)  │
 │  lru:     ...                    │
 │  refcount: 1                     │
-│  ptr:     (void*)12345  ◄── 포인터 대신 정수값 직접! 
+│  ptr:     (void*)12345  ◄── 포인터 대신 정수값 직접! │
 └──────────────────────────────────┘
 
 장점:
@@ -402,13 +439,13 @@ redis-cli OBJECT ENCODING float_counter  # embstr ("1.5")
 ```
 인코딩별 메모리 사용량 (키 제외):
 
-인코딩    | 조건           | 메모리          | malloc 횟수
-────────┼───────────────┼────────────────┼───────────
-int     | 정수값          | 16 bytes 고정   | 0회
-embstr  | ≤44 bytes     | 16+3+N+1 bytes | 1회
-        |               | jemalloc 슬롯에 맞춤
-raw     | ≥45 bytes     | 16 + SDS 별도   | 2회
-        |               | SDS: 헤더+N+1
+인코딩     | 조건           | 메모리          | malloc 횟수
+─────────┼───────────────┼────────────────┼───────────
+int      | 정수값          | 16 bytes 고정   | 0회
+embstr   | ≤44 bytes     | 16+3+N+1 bytes | 1회
+         |               | jemalloc 슬롯에 맞춤
+raw      | ≥45 bytes     | 16 + SDS 별도   | 2회
+         |               | SDS: 헤더+N+1
 
 실제 메모리 (jemalloc 슬롯 반영):
   "hello" (5 bytes):

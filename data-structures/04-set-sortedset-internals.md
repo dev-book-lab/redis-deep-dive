@@ -15,45 +15,77 @@
 
 ---
 
-## 🔍 왜 이 개념이 중요한가
+## 🔍 왜 이 개념이 실무에서 중요한가
 
-### Set과 Sorted Set의 인코딩을 모르면 메모리 폭탄을 밟는다
+Set의 `intset`은 정수를 압축 저장하고 이진 탐색으로 O(log N)을 보장한다. Sorted Set은 `skiplist + hashtable` 두 자료구조를 동시에 유지해 범위 쿼리와 O(1) 스코어 조회를 모두 지원한다. 이 구조를 모르면 인코딩 전환 순간에 메모리가 폭발하거나 올바른 자료구조를 선택하지 못한다.
+
+---
+
+## 😱 흔한 실수 (Before — 원리를 모를 때의 접근)
 
 ```
-실무 함정 1: 정수 ID Set에 문자열 태그 추가
+실수 1: 정수 Set에 문자열 하나 추가 → 메모리 폭발
 
-  초기 설계:
-    SADD user:1:permissions 1 2 3 4 5  (정수 권한 ID)
-    → intset 인코딩 → 압축 저장 → 소형 메모리
-  
-  나중에 추가:
-    SADD user:1:permissions "admin"    (문자열 태그 추가)
-    → 즉시 hashtable로 전환!
-    → 메모리 급증
-    
-  원리를 알면:
-    "정수만 있으면 intset, 하나라도 문자열이면 hashtable"
-    → 설계 시 권한 ID를 정수로 통일하거나 처음부터 문자열로 통일
+  초기 설계: 권한 ID를 정수로 관리
+    SADD user:1:perms 1 2 3 4 5
+    → intset: ~30 bytes (매우 작음)
 
-실무 함정 2: Sorted Set 스코어 남용
+  나중에 특별 권한 추가:
+    SADD user:1:perms "superadmin"
+    → 즉시 hashtable 전환!
+    → ~400 bytes (13배 증가)
+    → 100만 유저 × 370 bytes 추가 = 370 MB 갑자기 증가
+    → OBJECT ENCODING을 확인하지 않아서 원인 파악 불가
 
-  Set을 Sorted Set으로 업그레이드하면서:
-    ZADD ranking 0 "user:1"   # score=0으로 순서 없이 사용
-    ZADD ranking 0 "user:2"
-    → score가 모두 같으면 사실상 Set처럼 동작
-    → 하지만 skiplist + hashtable 두 자료구조 유지 → 메모리 낭비
-    
-  올바른 선택:
-    순서가 필요 없으면 Set 사용
-    순서가 필요하면 score를 의미 있게 사용 (timestamp, 점수 등)
+실수 2: Sorted Set을 Set처럼 쓰는 낭비
 
-실무 활용: Sorted Set이 빛나는 패턴
-  실시간 랭킹:
-    ZADD game:score 1500 "user:1"
-    ZADD game:score 2300 "user:2"
-    ZREVRANGE game:score 0 9 WITHSCORES  # 상위 10명
-    ZRANK game:score "user:1"            # 내 순위
-    → O(log N) + O(K) 으로 빠른 랭킹 조회
+  코드:
+    ZADD tags 0 "redis"    # score=0, 순서 필요 없음
+    ZADD tags 0 "python"
+    ZADD tags 0 "java"
+
+  문제:
+    실제로 순서가 필요 없음 (score 모두 0)
+    하지만 skiplist + hashtable 두 구조 유지
+    Set 대비 2~3배 메모리 사용
+    → Set을 써야 할 자리에 Sorted Set 사용
+
+실수 3: ZSCORE를 O(log N)이라고 착각
+
+  "Sorted Set은 skiplist라서 모든 연산이 O(log N)이겠지"
+  → ZSCORE는 실제로 O(1) (내부 hashtable 조회)
+  → ZRANK는 O(log N) (skiplist span 누산)
+  → 두 연산의 성능이 다름을 모르고 과도한 최적화 시도
+```
+
+---
+
+## ✨ 올바른 접근 (After — 원리를 알고 난 설계/운영)
+
+```
+Set 타입 통일 원칙:
+  정수 ID만 쓸 것이면 → 철저히 정수로 유지 (intset 유지)
+  문자열이 섞일 가능성 있으면 → 처음부터 문자열로 통일 (listpack → hashtable)
+
+  권한 ID 예:
+    정수만: SADD perms 1 2 3    → intset (압축, O(log N))
+    문자열 혼용 가능성: 처음부터 문자열
+    → SADD perms "read" "write"  → listpack (128개 이하) 또는 hashtable
+
+Set vs Sorted Set 선택:
+  순서/스코어 불필요 → Set (메모리 50% 절약)
+  랭킹/순서 필요 → Sorted Set (score 의미 있게 사용)
+
+Sorted Set 핵심 명령어 복잡도:
+  ZSCORE: O(1)     → hashtable 조회 (score 빠르게 필요 시)
+  ZRANK:  O(log N) → skiplist 탐색 (순위 계산)
+  ZADD:   O(log N) → skiplist 삽입
+  ZRANGEBYSCORE: O(log N + K) → 범위 쿼리
+
+실시간 랭킹 최적 패턴:
+  ZINCRBY game:score 100 "user:1"    # 점수 증가 O(log N)
+  ZREVRANGE game:score 0 9 WITHSCORES  # 상위 10명 O(log N + 10)
+  ZREVRANK game:score "user:1"       # 내 순위 O(log N)
 ```
 
 ---

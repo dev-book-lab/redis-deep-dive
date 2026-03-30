@@ -15,40 +15,78 @@
 
 ---
 
-## 🔍 왜 이 개념이 중요한가
+## 🔍 왜 이 개념이 실무에서 중요한가
 
-### 올바른 자료구조가 메모리 1000배 차이를 만든다
+Bitmap, HyperLogLog, Geo는 별도 자료구조처럼 보이지만 내부적으로는 String, Sorted Set 위에 구축된다. "어떤 문제를 얼마나 싸게 풀 수 있는가"를 결정하는 것이 이 특수 자료구조의 핵심이다. 잘못된 선택은 메모리 1,000배 차이를 만든다.
+
+---
+
+## 😱 흔한 실수 (Before — 원리를 모를 때의 접근)
 
 ```
-DAU(Daily Active User) 1억 명 추적 문제:
+실수 1: DAU 추적에 Set 사용 → 수 GB 메모리 낭비
 
-방법 1: Set으로 유저 ID 저장
-  SADD dau:2024-01-01 user_id_1 user_id_2 ...
-  유저 ID = 8 bytes (64bit integer)
-  1억 명 × 8 bytes = 800 MB (+ hashtable 오버헤드)
-  → 실제 1~2 GB
+  코드:
+    SADD dau:20240101 user_id_1 user_id_2 ...
+    SCARD dau:20240101  # DAU 계산
 
-방법 2: Bitmap (비트 하나로 유저 1명)
-  SETBIT dau:2024-01-01 user_id 1
-  1억 명 = 1억 bit = 12.5 MB
-  → Set 대비 80~160배 메모리 절약!
-  → 단, 유저 ID가 순차 정수인 경우만 효율적
+  결과:
+    1억 DAU × 8 bytes ID = 800 MB~2 GB per 일
+    30일치 보관 → 24~60 GB
+    → 메모리 비용 폭발
 
-방법 3: HyperLogLog (정확도 희생, 메모리 최소)
-  PFADD dau:2024-01-01 user_id_1 user_id_2 ...
-  메모리: 항상 고정 12 KB (원소 수 무관)
-  → PFCOUNT: 오차 ±0.81%
-  → "정확히 100,000,000명"이 아닌 "약 100,081,000명" 허용 시 사용
+실수 2: HyperLogLog로 멤버십 확인 시도
 
-방법별 비교:
-  Set:         800 MB~2 GB, 정확, 멤버십 확인 가능
-  Bitmap:      12.5 MB, 정확, ID가 정수인 경우만
-  HyperLogLog: 12 KB, 부정확(±0.81%), 카운트만 (멤버십 확인 불가)
+  코드:
+    PFADD visited user_123
+    # "이 유저가 방문했는지 확인하고 싶다"
+    # SISMEMBER 대신 HLL로 확인 방법 없을까?
 
-올바른 선택:
-  "정확한 유저 목록이 필요" → Set
-  "순차 정수 ID, 정확한 카운트" → Bitmap
-  "대략적 카운트만 필요, 메모리 절약" → HyperLogLog
+  문제:
+    HLL은 카운트 추정만 가능 (PFCOUNT)
+    특정 원소가 추가됐는지 확인 불가
+    → 멤버십 확인 = Set 또는 Bitmap 필요
+
+실수 3: Bitmap을 희소(sparse) ID에 사용 → 메모리 낭비
+
+  유저 ID가 랜덤 UUID를 정수로 변환한 값 (예: 8,000,000,000)
+  SETBIT dau 8000000000 1
+  → offset 80억 → ceil(80억/8) = 1 GB 메모리 (실제 유저 1명!)
+  → Bitmap은 ID가 밀집된 순차 정수일 때만 효율적
+```
+
+---
+
+## ✨ 올바른 접근 (After — 원리를 알고 난 설계/운영)
+
+```
+문제 유형별 선택:
+  ┌──────────────────────────────────┬──────────────┬──────────┐
+  │ 요구사항                           │ 자료구조        │ 메모리    │
+  ├──────────────────────────────────┼──────────────┼──────────┤
+  │ 정확한 DAU + 멤버십 확인 + 교집합      │ Set          │ ~2 GB    │
+  │ 정확한 DAU + 순차 정수 ID            │ Bitmap       │ 12.5 MB  │
+  │ 대략적 UV (오차 ±0.81% 허용)         │ HyperLogLog  │ 12 KB    │
+  │ 위치 기반 근접 탐색                   │ Geo          │ ZSet 수준│
+  └──────────────────────────────────┴──────────────┴──────────┘
+
+Bitmap의 조건과 사용법:
+  유저 ID가 순차 정수인 경우만 효율적
+  SETBIT dau:20240101 {user_id} 1    # 방문 기록
+  GETBIT dau:20240101 {user_id}      # 방문 여부 O(1)
+  BITCOUNT dau:20240101              # DAU 수 O(N/8)
+  BITOP AND both dau:01 dau:02       # 이틀 연속 방문자
+
+HyperLogLog의 올바른 용도:
+  정확도보다 메모리가 중요한 대용량 카운팅
+  PFADD uv:homepage user_id         # UV 추가
+  PFCOUNT uv:homepage               # UV 추정값
+  PFMERGE monthly uv:01 uv:02 ...   # 월간 UV 합산
+
+Geo 사용 조건 확인:
+  TYPE places → "zset"  (Sorted Set 기반)
+  정밀한 지리 쿼리(폴리곤 등) 필요 → PostGIS 검토
+  빠른 근접 탐색 (반경 검색) → Geo
 ```
 
 ---

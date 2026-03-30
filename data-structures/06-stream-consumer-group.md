@@ -15,47 +15,98 @@
 
 ---
 
-## 🔍 왜 이 개념이 중요한가
+## 🔍 왜 이 개념이 실무에서 중요한가
 
-### Pub/Sub과 Stream의 결정적 차이를 모르면 메시지를 잃는다
+Stream은 Redis에서 메시지를 영구 저장하고 Consumer Group으로 처리를 보장하는 유일한 자료구조다. PEL(Pending Entry List)이 없으면 처리 중 크래시 시 메시지가 사라진다는 것을 모르면, "한 번은 반드시 처리된다"는 보장이 없는 시스템을 만들게 된다.
+
+---
+
+## 😱 흔한 실수 (Before — 원리를 모를 때의 접근)
 
 ```
-실무 상황: 주문 이벤트 처리
+실수 1: 비즈니스 이벤트에 Pub/Sub 사용
 
-팀이 Pub/Sub을 선택한 경우:
-  PUBLISH order:events '{"order_id": 123, "status": "paid"}'
-  
-  문제가 발생하는 순간:
-  ① Consumer 서버가 재배포 중 (연결 끊김)
-     → 이 시간 동안 발행된 이벤트 전부 소실!
-     (Pub/Sub: 구독자 없으면 메시지 버림)
-  
-  ② Consumer 처리 도중 서버 크래시
-     → 처리 중이던 이벤트 재처리 방법 없음
-     (Pub/Sub: ACK 개념 없음)
-  
-  ③ 두 Consumer 서버가 동시에 이벤트 수신
-     → 동일 주문을 두 번 처리!
-     (Pub/Sub: 모든 구독자에게 브로드캐스트)
+  코드:
+    PUBLISH order:events '{"order_id": 123, "status": "paid"}'
 
-Stream을 선택한 경우:
-  XADD order:events '*' order_id 123 status paid
-  
-  ① Consumer 재배포 중
-     → 메시지가 Stream에 영구 저장
-     → 재시작 후 `last-delivered-id` 이후부터 이어서 처리
-  
-  ② Consumer 처리 도중 크래시
-     → PEL에 기록됨 (ACK 안 된 메시지)
-     → 다른 Consumer가 `XAUTOCLAIM`으로 재처리
-  
-  ③ 두 Consumer가 같은 Consumer Group
-     → 각 메시지는 하나의 Consumer에게만 전달
-     → 중복 처리 없음
+  장애 시나리오:
+    ① Consumer 서버 재배포 중 (30초 연결 끊김)
+       → 이 시간의 이벤트 전부 소실 (Pub/Sub: 구독자 없으면 버림)
+       → 결제된 주문 처리 안 됨 → 고객 불만
 
-결론:
-  메시지 손실 허용 + 브로드캐스트 → Pub/Sub
-  메시지 보존 + Consumer Group + 재처리 → Stream
+    ② Consumer가 처리 도중 서버 OOM으로 크래시
+       → 처리 중이던 메시지 재처리 방법 없음 (ACK 개념 없음)
+       → 주문 상태 불명확
+
+    ③ 두 Consumer가 동일 이벤트 중복 처리
+       → 동일 주문 두 번 결제 처리
+       → 환불 이슈
+
+실수 2: XACK를 빠뜨린 Consumer 코드
+
+  코드:
+    while True:
+        msgs = xreadgroup(group, consumer, ">", count=10)
+        for msg in msgs:
+            process(msg)
+        # XACK 누락!
+
+  결과:
+    PEL이 계속 쌓임 (처리됐지만 ACK 안 된 메시지)
+    XAUTOCLAIM이 주기적으로 같은 메시지를 재전달
+    → 중복 처리 + PEL 메모리 누수
+    → 며칠 후 XPENDING 확인 시 수만 건 pending
+
+실수 3: Stream 크기 제한 없이 XADD
+
+  코드: XADD events '*' data {payload}  # MAXLEN 없음
+  결과: Stream 메시지가 무한히 누적
+        1년 후 수억 건 → 수십 GB 메모리
+```
+
+---
+
+## ✨ 올바른 접근 (After — 원리를 알고 난 설계/운영)
+
+```
+비즈니스 이벤트 처리: Pub/Sub → Stream으로 전환
+
+  # Producer
+  XADD order:events '*' order_id 123 status paid amount 29900
+
+  # Consumer Group 생성 (한 번만)
+  XGROUP CREATE order:events processors $ MKSTREAM
+
+  # Consumer (올바른 패턴)
+  while True:
+      # 1. 자신의 pending 먼저 처리 (재시작 후 미처리 복구)
+      pending = xreadgroup(group, consumer, "0-0", count=10)
+      if pending:
+          process_and_ack(pending)
+
+      # 2. 새 메시지 처리
+      new_msgs = xreadgroup(group, consumer, ">", count=10)
+      if new_msgs:
+          process_and_ack(new_msgs)
+
+  def process_and_ack(msgs):
+      for msg in msgs:
+          try:
+              process(msg)
+              xack(stream, group, msg.id)  # 반드시 ACK
+          except Exception:
+              pass  # ACK 안 함 → PEL에 남아 재처리 가능
+
+독소 메시지 처리 (delivery_count 높은 메시지):
+  pending = xpending(stream, group, count=100)
+  for msg in pending:
+      if msg.delivery_count > 10:
+          xadd("dead_letter", msg)  # DLQ로 이동
+          xack(stream, group, msg.id)
+
+Stream 크기 관리:
+  XADD events MAXLEN ~ 100000 '*' ...  # 최대 10만 건 유지
+  or XTRIM events MAXLEN 100000        # 주기적 정리
 ```
 
 ---
@@ -68,7 +119,7 @@ Stream을 선택한 경우:
 Stream 메시지 ID 구조:
   <Unix timestamp ms>-<sequence>
   예: 1711234567890-0
-      │              └── 같은 ms 내 순서 (0부터)
+      │             └── 같은 ms 내 순서 (0부터)
       └── Unix timestamp (밀리초)
 
 자동 생성 ID ('*' 사용):
@@ -317,15 +368,15 @@ Stream 영속성:
 ┌─────────────────────────┬────────────────────────┬────────────────────────┐
 │ 특성                     │ Redis Stream           │ Apache Kafka           │
 ├─────────────────────────┼────────────────────────┼────────────────────────┤
-│ 저장 방식                 │ 메모리 (AOF/RDB 백업)     │ 디스크 (파티션 로그)       │
-│ 처리량                   │ 초당 수십만 건 (메모리)      │ 초당 수백만 건 (디스크)    │
+│ 저장 방식                 │ 메모리 (AOF/RDB 백업)     │ 디스크 (파티션 로그)        │
+│ 처리량                   │ 초당 수십만 건 (메모리)      │ 초당 수백만 건 (디스크)     │
 │ 메시지 보존               │ 메모리 한도 내             │ 설정된 기간/크기           │
 │ 컨슈머 그룹               │ 지원 (단순)               │ 지원 (파티션별 병렬)       │
 │ 파티셔닝                  │ 키 샤딩 (Cluster)        │ 파티션 내장              │
 │ 메시지 재처리              │ XCLAIM, XAUTOCLAIM     │ offset reset           │
 │ 멱등성 보장                │ 없음 (직접 구현)          │ Exactly-Once (트랜잭션)  │
 │ 운영 복잡도                │ 낮음                    │ 높음 (ZooKeeper/KRaft)  │
-│ 적합한 메시지 수            │ 수백만 건 이하            │ 수십억 건 이상            │
+│ 적합한 메시지 수            │ 수백만 건 이하            │ 수십억 건 이상             │
 └─────────────────────────┴────────────────────────┴────────────────────────┘
 
 Redis Stream 적합:

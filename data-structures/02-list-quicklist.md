@@ -15,47 +15,82 @@
 
 ---
 
-## 🔍 왜 이 개념이 중요한가
+## 🔍 왜 이 개념이 실무에서 중요한가
 
-### List 선택이 실무에서 틀리는 이유
+List는 Redis에서 가장 오해가 많은 자료구조다. "배열처럼 쓸 수 있겠지"라는 직관으로 접근하면 LINDEX 남용이나 무한 성장 List라는 함정에 빠진다. quicklist의 청크 구조를 이해하면 어떤 패턴이 효율적이고 어떤 패턴이 위험한지 보인다.
+
+---
+
+## 😱 흔한 실수 (Before — 원리를 모를 때의 접근)
 
 ```
-흔한 실수:
+실수 1: 크기 제한 없는 List로 무한 성장
 
-  시나리오: 최근 활동 피드 (최신 100개만 유지)
+  코드:
+    LPUSH activity:user:1 {event_json}
+    LRANGE activity:user:1 0 99  # 최신 100개 조회
+
+  문제:
+    이벤트를 계속 추가하면 → LLEN이 10만, 100만으로 증가
+    LRANGE 0 99는 여전히 빠르지만
+    메모리: 100만 × 원소 크기 = 수십 MB per 유저
+    10만 유저 → 수 TB 메모리 폭발
+
+실수 2: LRANGE 0 -1 전체 조회 남발
+
+  코드:
+    all_tasks = redis.lrange("queue", 0, -1)  # 전체 가져와서 처리
+    for task in all_tasks:
+        process(task)
+
+  문제:
+    queue에 100만 개 쌓이면 → LRANGE 0 -1 = O(N) + 수백 MB 네트워크 전송
+    이벤트 루프 독점 → 다른 요청 전부 타임아웃
+
+실수 3: LINDEX로 랜덤 액세스 반복
+
+  코드:
+    for i in range(len):
+        item = redis.lindex("list", i)  # O(N) × N 번 = O(N²)!
+        process(item)
+
+  문제:
+    List는 랜덤 액세스를 지원하지 않음 (설계상)
+    LINDEX는 O(N) — 중간 인덱스일수록 느림
+    N=1000개 List를 LINDEX로 순회: 500,000번 비교 = O(N²)
+```
+
+---
+
+## ✨ 올바른 접근 (After — 원리를 알고 난 설계/운영)
+
+```
+고정 크기 List (LPUSH + LTRIM 패턴):
+  LPUSH activity:user:1 {event_json}
+  LTRIM activity:user:1 0 99          # 항상 최신 100개만 유지
+  → 메모리 상한 고정: 100 × 원소 크기
+  → 원자적 실행 필요 시: MULTI/EXEC로 묶기
+
+분산 작업 큐 (RPUSH + BLPOP 패턴):
+  # Producer
+  RPUSH jobs:queue {task_json}        # O(1)
   
-  실수 코드:
-    LPUSH activity:user:1 event1 event2 ...
-    LRANGE activity:user:1 0 99    # 최신 100개 조회
-    LLEN activity:user:1           # 크기 확인
-    → 원소가 10만 개 쌓이면?
-    
-    LRANGE activity:user:1 0 99: O(100) → 여전히 빠름
-    LLEN activity:user:1:        O(1) → 빠름
-    하지만 메모리: 10만 개 × 원소 = 수십 MB
-    
-    올바른 설계:
-      LPUSH + LTRIM으로 길이 유지
-      redis-cli LPUSH activity:user:1 event
-      redis-cli LTRIM activity:user:1 0 99  # 항상 100개만 유지
-      → 크기 고정 → 메모리 예측 가능
-
-  시나리오: 분산 작업 큐 (Producer-Consumer)
+  # Consumer (블로킹 대기)
+  result = BLPOP jobs:queue 0         # 데이터 없으면 블로킹, 폴링 불필요
   
-  실수:
-    RPUSH queue task1
-    LRANGE queue 0 -1  # 전체 조회해서 처리할 태스크 선택
-    → O(N) 전체 스캔 + 네트워크 전송
-    
-  올바른 설계:
-    RPUSH queue task1       # Producer
-    BLPOP queue 0           # Consumer (블로킹 팝)
-    → O(1) + 블로킹 대기 지원
+  → 폴링 없음 → Redis 불필요한 호출 없음
+  → 여러 Consumer: 각자 BLPOP → 자동 분산
 
-원리를 알면 보이는 것:
-  quicklist의 청크 구조 → 메모리 지역성과 포인터 오버헤드 트레이드오프
-  LRANGE가 O(N)이지만 내부적으로 ziplist 청크를 연속 읽기 → 캐시 효율
-  LINDEX가 O(N)인 이유 → Random Access를 쓰면 안 된다는 신호
+전체 순회가 필요한 경우:
+  LRANGE list 0 99    # 페이징으로 분할 (한 번에 100개씩)
+  LRANGE list 100 199
+  ...
+  → LRANGE 0 -1 절대 금지 (크기가 클 수 있음)
+
+List가 부적합한 패턴:
+  랜덤 액세스 → Hash (O(1))
+  멤버십 확인 → Set (O(1))
+  중복 없는 정렬 → Sorted Set
 ```
 
 ---
@@ -183,10 +218,10 @@ ziplist의 cascade update 문제:
   → 연쇄적으로 전체 재할당 발생! (최악 O(N))
 
 listpack 구조 (Redis 7.0+, cascade update 해결):
-┌─────────────┬─────────────┬──────────────┬───────────┬────────┐
-│total-bytes  │ num-elements│ entry 1      │ entry 2   │  END   │
-│ (4 bytes)   │ (2 bytes)   │              │           │ 0xFF   │
-└─────────────┴─────────────┴──────────────┴───────────┴────────┘
+┌─────────────┬─────────────┬───────────┬───────────┬────────┐
+│ total-bytes │ num-elements│ entry 1   │ entry 2   │  END   │
+│ (4 bytes)   │ (2 bytes)   │           │           │ 0xFF   │
+└─────────────┴─────────────┴───────────┴───────────┴────────┘
 
 각 entry 구조 (prevlen 없음!):
 ┌──────────────┬───────────┬──────────────┐
@@ -287,7 +322,7 @@ quicklist 탐색 과정:
 
 설정 선택 가이드:
   ┌─────────────────────────────┬─────────────────┬────────────────────────┐
-  │ 워크로드                      │ 권장 설정         │ 이유                     │
+  │ 워크로드                      │ 권장 설정          │ 이유                   │
   ├─────────────────────────────┼─────────────────┼────────────────────────┤
   │ LPUSH/RPOP 위주 큐            │ -2 (기본)        │ 양 끝만 접근, 블록 크기 무관 │
   │ 작은 원소 대량 저장              │ 128 (양수)       │ 원소 수 기준, 예측 가능     │

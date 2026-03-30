@@ -15,39 +15,65 @@
 
 ---
 
-## 🔍 왜 이 개념이 중요한가
+## 🔍 왜 이 개념이 실무에서 중요한가
 
-### "Hash가 listpack 범위를 넘는 순간 메모리가 폭발한다"
+Hash는 `listpack`(소형)과 `hashtable`(대형) 두 가지 인코딩으로 동작한다. 이 경계를 모르면 메모리가 갑자기 2~4배로 폭발하는 시점을 예측할 수 없다. 점진적 rehashing 원리를 알아야 BGSAVE 중 메모리 증가의 진짜 원인을 이해할 수 있다.
+
+---
+
+## 😱 흔한 실수 (Before — 원리를 모를 때의 접근)
 
 ```
-실무 상황: 사용자 프로필 캐싱
+실수 1: Hash 필드 수 제한 없이 추가하다가 메모리 폭발
 
-방법 1: 각 필드를 별도 String으로 저장
-  SET user:1:name "Alice"
-  SET user:1:age "30"
-  SET user:1:email "alice@example.com"
-  SET user:1:city "Seoul"
-  → 4개 키 × redisObject(16) + SDS + 키 오버헤드 ≈ 400~600 bytes
-  → 100만 유저 = 400~600 MB
+  설계: HSET user:{id} 에 200개 필드 저장
+  결과: 128번째 필드 추가 순간 → listpack → hashtable 전환
+        메모리: Hash 1개당 150 bytes → 3,000 bytes (20배!)
+        100만 유저 × 2,850 bytes 증가 = 2.7 GB 추가 소비
+        → 갑작스러운 메모리 부족 (근본 원인 파악 못 함)
 
-방법 2: Hash로 묶어서 저장 (listpack 범위 내)
-  HSET user:1 name "Alice" age "30" email "alice@example.com" city "Seoul"
-  → 4 필드짜리 Hash (listpack) ≈ 100~150 bytes
-  → 100만 유저 = 100~150 MB (String 방식의 25~37%)
+실수 2: HGETALL로 대형 Hash 전체 조회
 
-  why? listpack: 포인터 오버헤드 없이 연속 메모리에 필드+값을 직접 저장
-       키 오버헤드: Hash 키 1개 vs String 키 4개
+  코드: 200개 필드짜리 Hash를 HGETALL로 반복 조회
+  결과: hashtable 인코딩 → HGETALL O(N) → 200개 반환
+        초당 수천 번 호출 시 이벤트 루프 부담
+        → HSCAN으로 분할 조회 필요
 
-방법 2의 함정: listpack 범위를 넘는 순간
-  필드 수가 128을 초과하거나 값 크기가 64 bytes를 초과하면
-  → hashtable로 전환 → 메모리가 2~4배로 증가!
-  
-  "작게 유지 = listpack = 메모리 절약"
-  "한 번 크게 = hashtable = 다시 돌아올 수 없음"
+실수 3: BGSAVE 중 메모리가 2배 됐다고 착각
 
-이걸 모르면:
-  Hash에 필드를 계속 추가하다가 128개를 넘는 순간
-  메모리가 갑자기 2~4배 증가 → 원인 파악 불가
+  현상: BGSAVE 실행 후 used_memory_rss 급증
+  잘못된 원인 분석: "RDB 저장이 메모리를 2배 사용한다"
+  실제 원인: 
+    BGSAVE 중 rehashing 발생 (load_factor ≥ 5.0 임계)
+    COW + ht[0]/ht[1] 동시 존재 → 일시적 추가 메모리
+    → maxmemory를 RAM의 50%로 낮춰야 하는 이유
+```
+
+---
+
+## ✨ 올바른 접근 (After — 원리를 알고 난 설계/운영)
+
+```
+listpack 유지를 위한 Hash Sharding:
+  200개 필드를 그룹으로 분할:
+    HSET user:{id}:profile  name age city bio      (4 필드)
+    HSET user:{id}:stats     login_count last_seen  (2 필드)
+    HSET user:{id}:prefs     theme lang notif        (3 필드)
+  → 각 Hash가 listpack 유지 → 메모리 효율 최대
+  → Pipeline으로 3개 Hash 조회 (RTT 1회)
+
+임계값 경계 모니터링:
+  HLEN user:1              # 현재 필드 수 확인
+  OBJECT ENCODING user:1   # listpack이면 안전, hashtable이면 분리 필요
+  MEMORY USAGE user:1      # 실제 메모리
+
+대형 Hash 안전 순회:
+  # HGETALL 금지 (대형 Hash에서 이벤트 루프 차지)
+  HSCAN user:1 0 COUNT 50  # 커서 기반 분할
+
+maxmemory 설정 (rehashing + COW 대비):
+  BGSAVE 사용 시: maxmemory = 물리 RAM × 0.5
+  → rehashing 중 ht[0]+ht[1] 동시 + COW 대비
 ```
 
 ---

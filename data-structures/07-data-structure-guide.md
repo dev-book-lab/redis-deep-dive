@@ -14,43 +14,81 @@
 
 ---
 
-## 🔍 왜 이 개념이 중요한가
+## 🔍 왜 이 개념이 실무에서 중요한가
 
-### 자료구조 선택이 서버 비용을 결정한다
+같은 데이터를 어떤 자료구조에 어떤 인코딩으로 저장하느냐에 따라 메모리가 10배 이상 달라진다. Redis 비용의 대부분은 메모리 비용이므로, 자료구조 선택은 기능의 문제가 아니라 인프라 비용의 문제다.
+
+---
+
+## 😱 흔한 실수 (Before — 원리를 모를 때의 접근)
 
 ```
-실제 사례 패턴:
+실수 1: 구조화 데이터를 모두 String으로 저장
 
-  서비스: 유저 10만 명의 프로필 캐싱 (이름, 나이, 도시, 가입일 등 10개 필드)
-
-  팀 A (String 방식):
+  10만 유저 프로필 (이름, 나이, 도시 등 10개 필드):
     SET user:1:name "Alice"
     SET user:1:age "30"
-    SET user:1:city "Seoul"
-    ... (10개 키)
+    ... (10개 키 × 10만 유저 = 100만 키)
     
-    10만 유저 × 10 필드 = 100만 개 키
-    각 키 = redisObject + SDS(키명) + redisObject + SDS(값) + dict entry
-    평균 키당 약 150~200 bytes
-    총: 150~200 MB
+  메모리: ~150~200 MB
   
-  팀 B (Hash + listpack 유지):
-    HSET user:1 name "Alice" age "30" city "Seoul" ...
-    
-    10만 유저 = 10만 개 Hash (각 10필드 → listpack)
-    Hash당 약 300~400 bytes (listpack: 포인터 오버헤드 없음)
-    총: 30~40 MB
-    
-    → 팀 A 대비 5배 메모리 절약
-    → EC2 r5.large(16 GB, $180/월) → r5.medium(8 GB, $90/월) 가능
-    → 연 $1,080 절약 (단순 계산)
+  Hash(listpack)으로 저장했다면: ~30~40 MB
+  → 5배 낭비 → EC2 인스턴스 한 단계 업그레이드 비용 불필요하게 발생
 
-  팀 C (Hash + hashtable 전환 허용):
-    같은 HSET이지만 필드 200개 → hashtable 전환
-    Hash당 약 3,000~5,000 bytes
-    총: 300~500 MB → 팀 A보다 오히려 2~3배 더 사용!
+실수 2: 자료구조를 "기능"으로만 선택
 
-"자료구조 선택은 기능의 문제가 아니라 비용의 문제다"
+  "순서가 필요하니 Sorted Set!"
+  → score를 모두 0으로 설정 (사실상 Set처럼 사용)
+  → skiplist + hashtable 두 구조 유지 → Set 대비 2~3배 메모리
+  
+  "편하니까 String에 JSON 저장"
+  → 개별 필드 업데이트 불가 (전체 GET→수정→SET)
+  → Hash(listpack)보다 메모리 비효율 가능
+
+실수 3: MEMORY USAGE 없이 최적화 시도
+
+  "Hash가 비효율적인 것 같아서 String으로 바꿨습니다"
+  → 실제로는 Hash(listpack)이 String보다 더 효율적이었음
+  → 측정 없는 최적화 = 오히려 악화
+
+실수 4: 인코딩 전환 임박을 모르고 데이터 추가
+
+  Hash 필드를 127개까지 안전하게 유지하다가
+  → 128개→129개 추가 시 hashtable 전환
+  → 메모리 갑자기 4배 증가 → 모니터링 없으면 원인 파악 불가
+```
+
+---
+
+## ✨ 올바른 접근 (After — 원리를 알고 난 설계/운영)
+
+```
+측정 → 인코딩 확인 → 최적화 결정:
+  1. OBJECT ENCODING key   → 현재 인코딩 파악
+  2. MEMORY USAGE key      → 실제 바이트 측정
+  3. 인코딩이 listpack이면 유지 설계, hashtable이면 분할 설계
+
+자료구조 선택 원칙:
+  "이 데이터에 listpack을 유지할 수 있는가?"
+  → Yes: Hash(listpack) = 메모리 최적
+  → No (필드 >128): Hash Sharding 또는 JSON String
+
+패턴별 최적 선택:
+  카운터         → String + INCR (int 인코딩)
+  구조화 데이터   → Hash (listpack 유지 설계)
+  순서 있는 목록  → List (LPUSH + LTRIM)
+  멤버십 확인     → Set (intset 또는 listpack)
+  랭킹/정렬      → Sorted Set (score 의미 있게)
+  근사 통계       → HyperLogLog
+  위치 탐색       → Geo
+
+인코딩 전환 모니터링:
+  # 인코딩이 바뀐 키 탐지 스크립트
+  redis-cli SCAN 0 COUNT 100 | tail -n +2 | while read key; do
+    enc=$(redis-cli OBJECT ENCODING "$key" 2>/dev/null)
+    echo "$key $enc"
+  done | grep "hashtable\|skiplist" | head -20
+  → listpack → hashtable 전환된 키 발견 시 분할 설계 적용
 ```
 
 ---
@@ -604,7 +642,7 @@ Hash listpack이 String보다 3배 효율적인 이유:
 │ 멤버십 체크       │      │      │        │ ✓✓     │          │      │       │
 │ 랭킹/정렬         │      │      │        │        │ ✓✓       │      │       │
 │ 시간 범위 탐색     │      │      │        │        │ ✓✓       │      │       │
-│ 카디널리티 추정    │      │      │        │        │          │ ✓✓   │       │
+│ 카디널리티 추정     │      │      │        │        │          │ ✓✓   │       │
 │ 위치 기반 탐색     │      │      │        │        │          │      │ ✓✓    │
 │ 메시지 큐         │      │ ✓    │        │        │          │      │       │
 │ 처리 보장 큐       │ ※    │      │        │        │          │      │       │
