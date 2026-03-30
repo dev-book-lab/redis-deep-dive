@@ -572,6 +572,6 @@ MULTI/EXEC나 원자성이 중요 → io-threads=4 (단일 keyspace 필요)
 
 <div align="center">
 
-**[⬅️ 이전: 키 만료 메커니즘](./04-key-expiry.md)** | **[홈으로 🏠](../README.md)** | **[다음: Chapter 2 — String과 SDS ➡️](../data-structures/01-string-sds.md)**
+**[홈으로 🏠](../README.md)** | **[다음: Chapter 2 — String과 SDS ➡️](../data-structures/01-string-sds.md)**
 
 </div>
