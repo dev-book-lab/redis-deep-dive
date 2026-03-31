@@ -763,6 +763,6 @@ redis-cli -p 6380 -h replica_host INFO replication | grep role
 
 <div align="center">
 
-**[⬅️ 이전: 장애 복구 절차](./04-disaster-recovery.md)** | **[홈으로 🏠](../README.md)** | **[다음: Chapter 4 — 복제와 HA ➡️](../replication-ha/01-replication-internals.md)**
+**[⬅️ 이전: 장애 복구 절차](./04-disaster-recovery.md)** | **[홈으로 🏠](../README.md)** | **[다음: Chapter 4 — 복제와 HA ➡️](../replication-ha/01-master-replica-psync.md)**
 
 </div>

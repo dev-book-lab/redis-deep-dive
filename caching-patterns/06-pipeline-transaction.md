@@ -702,6 +702,6 @@ for i in range(0, len(keys), batch_size):
 
 <div align="center">
 
-**[⬅️ 이전: Pub/Sub vs Stream](./05-pubsub-vs-stream.md)** | **[홈으로 🏠](../README.md)** | **[다음: Chapter 6 — 성능과 운영 ➡️](../performance-operations/01-memory-profiling.md)**
+**[⬅️ 이전: Pub/Sub vs Stream](./05-pubsub-vs-stream.md)** | **[홈으로 🏠](../README.md)** | **[다음: Chapter 6 — 성능과 운영 ➡️](../performance-operations/01-slowlog-bottleneck.md)**
 
 </div>

@@ -637,6 +637,6 @@ tail -50 /var/log/redis/redis.log | grep -i "bgsave\|rdb"
 
 <div align="center">
 
-**[⬅️ 이전: Redis 모니터링](./04-monitoring.md)** | **[홈으로 🏠](../README.md)** | **[다음: Chapter 7 — Spring Redis 통합 ➡️](../spring-redis/01-spring-data-redis.md)**
+**[⬅️ 이전: Redis 모니터링](./04-monitoring.md)** | **[홈으로 🏠](../README.md)** | **[다음: Chapter 7 — Spring Redis 통합 ➡️](../spring-redis/01-redis-template-serialization.md)**
 
 </div>

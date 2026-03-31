@@ -565,6 +565,6 @@ redis-cli -p 7001 INFO replication
 
 <div align="center">
 
-**[⬅️ 이전: 클러스터 리샤딩](./04-cluster-resharding.md)** | **[홈으로 🏠](../README.md)** | **[다음: Chapter 5 — 캐싱 패턴 ➡️](../caching-patterns/01-cache-aside.md)**
+**[⬅️ 이전: 클러스터 리샤딩](./04-cluster-resharding.md)** | **[홈으로 🏠](../README.md)** | **[다음: Chapter 5 — 캐싱 패턴 ➡️](../caching-patterns/01-caching-strategies.md)**
 
 </div>
